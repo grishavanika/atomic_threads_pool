@@ -1,6 +1,6 @@
 // Implementation of threads pool with "Single-Thread Queue" idea
 // from CppCon 2015: Fedor Pikus PART 2 "Live Lock-Free or Deadlock (Practical Lock-free Programming)"
-// talk : https ://youtu.be/1obZeHnAwz4.
+// talk: https://youtu.be/1obZeHnAwz4.
 #pragma once
 
 #include <atomic>
@@ -156,6 +156,7 @@ namespace nn
 
         SuspendStatus try_suspend_thread(std::size_t thread_id);
         bool try_resume_any_thread();
+        void clear_suspended_flag(std::size_t thread_id, std::uint64_t suspended_threads_mask);
         void resume_thread(std::size_t thread_id, std::uint64_t suspended_threads_mask);
 
     private:
@@ -342,15 +343,30 @@ namespace nn
             std::move(process)();
         };
 
+        SuspendStatus last_suspend = SuspendStatus::Failed;
+
+        auto clean_last_suspend = [this, thread_id](SuspendStatus& status)
+        {
+            if (status == SuspendStatus::FromActiveToSuspended)
+            {
+                clear_suspended_flag(thread_id
+                    , _suspended_threads.load(std::memory_order_relaxed));
+            }
+            status = SuspendStatus::Failed;
+        };
+
+
         while (not _exit.load(std::memory_order_relaxed))
         {
             bool steal_from_others = false;
             switch (try_pop_task(thread_id, task))
             {
             case PopStatus::Ok:
+                clean_last_suspend(last_suspend);
                 execute(task);
                 break;
             case PopStatus::Locked:
+                clean_last_suspend(last_suspend);
                 // Try again.
                 steal_from_others = false;
                 break;
@@ -368,12 +384,14 @@ namespace nn
             switch (status)
             {
             case StealStatus::Ok:
+                clean_last_suspend(last_suspend);
                 execute(task);
                 break;
             case StealStatus::SomeOrAllLocked:
+                clean_last_suspend(last_suspend);
                 break;
             case StealStatus::AllEmpty:
-                (void)try_suspend_thread(thread_id);
+                last_suspend = try_suspend_thread(thread_id);
                 break;
             }
         }
@@ -512,8 +530,8 @@ namespace nn
         return false;
     }
 
-    void AtomicThreadsPool::resume_thread(
-        std::size_t thread_id, std::uint64_t suspended_threads_mask)
+    void AtomicThreadsPool::clear_suspended_flag(std::size_t thread_id
+        , std::uint64_t suspended_threads_mask)
     {
         assert(thread_id < 64);
         auto make_mask = [this, &thread_id](std::uint64_t current)
@@ -531,7 +549,12 @@ namespace nn
         {
             desired = make_mask(expected);
         }
+    }
 
+    void AtomicThreadsPool::resume_thread(std::size_t thread_id
+        , std::uint64_t suspended_threads_mask)
+    {
+        clear_suspended_flag(thread_id, suspended_threads_mask);
         // Even if (possible) thread was not suspended because bit was not set,
         // we still need to signal; this is to avoid case when threads
         // want to go to sleep right now.
