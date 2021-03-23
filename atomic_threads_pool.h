@@ -116,7 +116,7 @@ namespace nn
         void start_all();
         void stop_all();
 
-        void schedule(Task&& task);
+        void schedule(Task&& task, std::size_t thread_id_hint = 0);
 
     private:
         enum class PopStatus
@@ -133,7 +133,16 @@ namespace nn
             AllEmpty,
         };
 
-        void execute_from_best(Task&& task);
+        enum class SuspendStatus
+        {
+            Failed,
+            FromActiveToSuspended,
+            FromSuspendedToSuspended,
+        };
+
+        void create_all();
+
+        void execute_from_best(Task&& task, std::size_t thread_id_hint);
 
         void thread_loop(std::size_t thread_id
             , std::shared_future<void> on_start
@@ -145,12 +154,12 @@ namespace nn
 
         StealStatus try_steal_task_from_others(std::size_t ignore_thread_id, Task& task);
 
-        void try_suspend_thread(std::size_t thread_id);
+        SuspendStatus try_suspend_thread(std::size_t thread_id);
         bool try_resume_any_thread();
         void resume_thread(std::size_t thread_id, std::uint64_t suspended_threads_mask);
 
     private:
-        static thread_local std::size_t _thread_id;
+        static thread_local std::size_t _self_thread_id;
 
         struct ThreadState
         {
@@ -170,19 +179,21 @@ namespace nn
         std::promise<void> _on_start;
     };
 
-    /*static*/ thread_local std::size_t AtomicThreadsPool::_thread_id = std::size_t(-1);
+    /*static*/ thread_local std::size_t AtomicThreadsPool::_self_thread_id = std::size_t(-1);
 
     /*explicit*/ AtomicThreadsPool::AtomicThreadsPool(std::size_t threads_count)
         : _threads_count(threads_count)
         , _all_suspended_mask((std::uint64_t(1) << _threads_count) - 1)
         , _states(std::make_unique<ThreadState[]>(threads_count))
         , _suspended_threads(0)
-        , _exit(false)
+        , _exit(true)
         , _on_start()
     {
         assert(_threads_count > 0);
         // Because of `_suspended_threads` bookkeeping (one bit per uint64_t).
         assert(_threads_count < 64);
+
+        create_all();
     }
 
     AtomicThreadsPool::~AtomicThreadsPool()
@@ -190,11 +201,9 @@ namespace nn
         stop_all();
     }
 
-    void AtomicThreadsPool::start_all()
+    void AtomicThreadsPool::create_all()
     {
-        assert(not _states);
-
-        _exit = false;
+        assert(_exit);
 
         // Start & wait all started threads.
         _on_start = {};
@@ -216,7 +225,12 @@ namespace nn
 
         // Wait for everyone to start.
         (void)all_created_event.get();
+    }
 
+    void AtomicThreadsPool::start_all()
+    {
+        assert(_exit);
+        _exit = false;
         _on_start.set_value();
     }
 
@@ -224,9 +238,11 @@ namespace nn
     {
         if (not _states)
         {
+            // Was already stopped by someone. Just to be nice in d-tor.
             return;
         }
 
+        assert(not _exit);
         _exit = true;
         for (std::size_t i = 0; i < _threads_count; ++i)
         {
@@ -236,36 +252,29 @@ namespace nn
         {
             _states[i]._thread.join();
         }
-#if (0)
-        std::size_t active_tasks = 0;
-        for (std::size_t i = 0; i < _threads_count; ++i)
-        {
-            active_tasks += _states[i]._unsafe_queue.size();
-        }
-        assert(active_tasks == 0);
-#endif
 
         _states.reset();
     }
 
-    void AtomicThreadsPool::schedule(Task&& task)
+    void AtomicThreadsPool::schedule(Task&& task, std::size_t thread_id_hint /*= 0*/)
     {
-        execute_from_best(std::move(task));
+        execute_from_best(std::move(task), thread_id_hint);
     }
 
-    void AtomicThreadsPool::execute_from_best(Task&& task)
+    void AtomicThreadsPool::execute_from_best(Task&& task, std::size_t thread_id_hint)
     {
         assert(task);
+        assert(thread_id_hint < _threads_count);
 
-        const std::size_t this_thread_id = _thread_id;
-        if (this_thread_id != std::size_t(-1))
+        if (std::size_t thread_id = _self_thread_id; thread_id != std::size_t(-1))
         {
             // We are inside some worker thread.
             // Try to push to its own queue.
-            while (not try_push_task(this_thread_id, std::move(task)))
+            while (not try_push_task(thread_id, std::move(task)))
             {
                 // This can happen if some other worker wants to steal
-                // from this queue. No-op for now.
+                // from this queue. Try another queue now.
+                thread_id = ((thread_id + 1) % _threads_count);
             }
 
             // We know by definition that at least one thread is active
@@ -284,18 +293,32 @@ namespace nn
         }
 
         const std::uint64_t suspended_threads = _suspended_threads.load(std::memory_order_relaxed);
-        // Select first thread if there are possibly-no suspended threads.
-        const std::size_t thread_id = detail::find_first_set_bit(suspended_threads).value_or(0);
-
+        const std::optional<std::size_t> suspended_thread_id = detail::find_first_set_bit(suspended_threads);
+        std::size_t thread_id = suspended_thread_id.value_or(thread_id_hint);
         while (not try_push_task(thread_id, std::move(task)))
         {
             // This can happen if some other worker wants to steal
-            // from this queue. No-op for now.
+            // from this queue. Try another queue.
+            thread_id = ((thread_id + 1) % _threads_count);
         }
 
-        resume_thread(thread_id, suspended_threads);
-        // 
-        // assert(running_threads_count >= 1);
+        if (suspended_thread_id)
+        {
+            // We knew there _was_ some suspended thread. Try to resume it.
+            // If it was already resumed - that's fine, the thread will just grab our task
+            // and we are good to go (no need to double-check suspended thread after we inserted the task).
+            resume_thread(*suspended_thread_id, suspended_threads);
+            // assert(running_threads_count >= 1);
+            return;
+        }
+
+        // We need to resume someone because we did insert into
+        // queue thinking all threads were running. But all of them
+        // may go to sleep and miss new task.
+        (void)try_resume_any_thread();
+        // Edge-case: no threads may be resumed there. And that's fine because right
+        // before going to sleep `thread_loop()` goes and checks queues again
+        // after raising `_suspended_threads` flags.
     }
 
     void AtomicThreadsPool::thread_loop(std::size_t thread_id
@@ -303,7 +326,7 @@ namespace nn
         , std::promise<void>& on_all_created
         , std::atomic_size_t& created_now)
     {
-        _thread_id = thread_id; // Set to thread-local.
+        _self_thread_id = thread_id; // Set to thread-local.
 
         if (++created_now == _threads_count)
         {
@@ -350,7 +373,7 @@ namespace nn
             case StealStatus::SomeOrAllLocked:
                 break;
             case StealStatus::AllEmpty:
-                try_suspend_thread(thread_id);
+                (void)try_suspend_thread(thread_id);
                 break;
             }
         }
@@ -436,17 +459,28 @@ namespace nn
             : StealStatus::SomeOrAllLocked;
     }
 
-    void AtomicThreadsPool::try_suspend_thread(std::size_t thread_id)
+    auto AtomicThreadsPool::try_suspend_thread(std::size_t thread_id)
+        -> SuspendStatus
     {
         assert(thread_id < 64);
 
         std::uint64_t expected = _suspended_threads.load(std::memory_order::relaxed);
-        const std::uint64_t desired = (expected | (std::uint64_t(1) << std::uint64_t(thread_id)));
+        const std::uint64_t thread_mask = (std::uint64_t(1) << std::uint64_t(thread_id));
+        const std::uint64_t desired = (expected | thread_mask);
         if (_suspended_threads.compare_exchange_weak(
             expected
             , desired
             , std::memory_order_acq_rel))
         {
+            if ((expected & thread_mask) == 0)
+            {
+                // We went from "active" thread to "suspended".
+                // Don't go to sleep now, give a chance to thread
+                // to check queues again. This is needed to handle
+                // possible edge-case in execute_from_best(), see "Edge-case" note.
+                return SuspendStatus::FromActiveToSuspended;
+            }
+
             // Race between `_suspended_threads` set and event wait is fine
             // (someone can re-set mask we set just now and make
             // event signaled _before_ we go to actual wait;
@@ -457,12 +491,13 @@ namespace nn
             // Note: there we can't expect for the bit to be zero.
             // Event may become signaled simply to wake-up all threads
             // to check & stop the work, as example.
-            return;
+            return SuspendStatus::FromSuspendedToSuspended;
         }
 
         // In case we failed to set, do not try to do strong CAS
         // again. We simply let the thread try to steal tasks from
         // possibly empty queues and go to try-suspend again.
+        return SuspendStatus::Failed;
     }
 
     bool AtomicThreadsPool::try_resume_any_thread()
