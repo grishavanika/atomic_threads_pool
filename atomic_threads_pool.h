@@ -188,9 +188,9 @@ namespace nn
 
         SuspendStatus try_suspend_thread(ThreadIndex thread_id);
         bool try_resume_any_thread();
+        void resume_thread(ThreadIndex thread_id, std::uint64_t suspended_threads_mask);
 
         void mark_thread_enabled(ThreadIndex thread_id, std::uint64_t suspended_threads_mask);
-        void resume_thread(ThreadIndex thread_id, std::uint64_t suspended_threads_mask);
 
     private:
         static constexpr ThreadIndex kNoThreadId = ThreadIndex(-1);
