@@ -7,6 +7,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <future>
 #include <optional>
 #include <functional>
@@ -22,7 +23,7 @@
 namespace nn
 {
 
-    using Task = std::function<void()>;
+    using Task = std::function<void ()>;
 
     namespace detail
     {

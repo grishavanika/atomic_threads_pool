@@ -7,6 +7,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <future>
 #include <functional>
 #include <new> // obviously, for hardware_destructive_interference_size.
@@ -17,7 +18,7 @@
 namespace nn
 {
 
-    using Task = std::function<void()>;
+    using Task = std::function<void ()>;
 
     namespace detail
     {
@@ -158,7 +159,7 @@ namespace nn
         StealStatus try_steal_task_from_others(ThreadIndex ignore_thread_id, Task& task);
 
         SuspendStatus try_suspend_thread(ThreadIndex thread_id, bool was_disabled);
-        bool try_resume_any_thread();
+        bool try_resume_any_thread(std::memory_order lookup_order);
         void resume_thread(ThreadIndex thread_id);
 
         void mark_thread_enabled(ThreadIndex thread_id);
@@ -275,7 +276,9 @@ namespace nn
             // This is to avoid case when only our thread is active and
             // produces multiple tasks; without resuming the thread
             // we end up in a situation were single-thread consumes all the work.
-            (void)try_resume_any_thread();
+            // Memory order relaxed should be good there (this will eventually resume
+            // additional thread when doing multiple inserts).
+            (void)try_resume_any_thread(std::memory_order_relaxed);
             // Note: in case there are no suspended threads (or we think so -
             // some or all other threads may go  to sleep right now) - we are fine
             // because at least our current thread is active.
@@ -284,19 +287,24 @@ namespace nn
             return;
         }
 
-        ThreadIndex maybe_suspended = 0;
-        bool found_suspended = false;
+        ThreadIndex maybe_suspended = kNoThreadId;
         for (ThreadIndex id = 0; id < _threads_count; ++id)
         {
+            // It's fine to use relaxed there: just a hint of where
+            // we can insert-and-possibly resume a thread.
+            // We either will resume not-suspended thread (if wrong index is found)
+            // or will fall back to resume any thread for real
+            // (see the end of this function).
             if (_states[id]._suspended.load(std::memory_order_relaxed))
             {
                 maybe_suspended = id;
-                found_suspended = true;
                 break;
             }
         }
 
-        ThreadIndex thread_id = maybe_suspended;
+        ThreadIndex thread_id = (maybe_suspended == kNoThreadId)
+            ? 0
+            : maybe_suspended;
         while (not try_push_task(thread_id, std::move(task)))
         {
             // This can happen if some other worker wants to steal
@@ -304,7 +312,7 @@ namespace nn
             thread_id = ThreadIndex((thread_id + 1) % _threads_count);
         }
 
-        if (found_suspended)
+        if (maybe_suspended != kNoThreadId)
         {
             // We knew there _was_ some suspended thread. Try to resume it.
             // If it was already resumed - that's fine, the thread will just grab our task
@@ -317,7 +325,9 @@ namespace nn
         // We need to resume someone because we did insert into
         // queue thinking all threads were running. But all of them
         // may go to sleep and miss new task.
-        (void)try_resume_any_thread();
+        // Use stronger memory order to compensate relaxed memory order used
+        // above in case it misses that all threads are suspended).
+        (void)try_resume_any_thread(std::memory_order_acquire);
         // Edge-case: no threads may be resumed there. And that's fine because right
         // before going to sleep `thread_loop()` goes and checks queues again
         // after raising `_suspended` flag.
@@ -511,11 +521,11 @@ namespace nn
         return SuspendStatus::None;
     }
 
-    bool AtomicThreadsPool::try_resume_any_thread()
+    bool AtomicThreadsPool::try_resume_any_thread(std::memory_order lookup_order)
     {
         for (ThreadIndex thread_id = 0; thread_id < _threads_count; ++thread_id)
         {
-            if (_states[thread_id]._suspended.load(std::memory_order_relaxed))
+            if (_states[thread_id]._suspended.load(lookup_order))
             {
                 resume_thread(thread_id);
                 return true;
